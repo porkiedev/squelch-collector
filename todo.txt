@@ -1,0 +1,1 @@
+Add support for FLEX pager types beyond alphanumeric

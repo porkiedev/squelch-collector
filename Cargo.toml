@@ -1,0 +1,18 @@
+[package]
+name = "squelch-collector"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = "0.3"
+clap = {  version = "4.6.2", features = ["derive", "env"] }
+anyhow = "1.0.102"
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "net", "macros", "io-std", "io-util", "rt", "fs"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_plain = "1.0.2"
+serde_json = "1.0"
+strum = { version = "0.28", features = ["derive"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+#reqwest = {  version = "0.13.4", features = ["json"] }
+surrealdb = {  version = "3.2.1", features = ["protocol-ws"] }
