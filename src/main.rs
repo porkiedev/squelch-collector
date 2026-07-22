@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
                 }
             };
             let Some(r) = r else { continue };
-            info!("Inserted Flex pager into database: {:?}", r.key);
+            trace!("Inserted Flex pager into database: {:?}", r.key);
 
             continue;
         }
