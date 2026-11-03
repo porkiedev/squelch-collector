@@ -1,6 +1,7 @@
 #![allow(unused)]
 
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing::{debug, error, info, trace, warn, Level};
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -10,11 +11,18 @@ use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use serde_plain::Error;
-use surrealdb::engine::remote::ws::Wss;
+use surrealdb::engine::remote::ws::{Client, Wss};
 use surrealdb::Surreal;
 use surrealdb::types::{RecordId, SurrealValue};
 use tokio::io::{stdin, AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::fs::File;
+use tokio::time::timeout;
+
+/// How long to wait for a single database operation before assuming the connection is dead
+const DB_OP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Initial/maximum delay between reconnection attempts
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,17 +39,11 @@ async fn main() -> Result<()> {
     // Parse the cli arguments
     let args = Args::parse();
 
-    // Connect and authenticate with the database
-    let db = Surreal::new::<Wss>(args.database_url).await?;
-    db.signin(surrealdb::opt::auth::Database {
-        namespace: args.ns,
-        database: args.db,
-        username: args.username,
-        password: args.password,
-    }).await?;
+    // Connect and authenticate with the database, retrying indefinitely if it's unreachable
+    let mut db = connect_db_with_retry(&args).await;
 
     // Open the file/stdin
-    let reader = BufReader::new(open_input(args.input_path).await?);
+    let reader = BufReader::new(open_input(args.input_path.clone()).await?);
     // Process every new line as a separate pager
     let mut lines = reader.lines();
     while let Some(line) = lines.next_line().await? {
@@ -71,17 +73,8 @@ async fn main() -> Result<()> {
                 message,
             };
 
-            // Try to insert the record into the database
-            let r = match db.create::<Option<RecordId>>("flex_next_messages").content(msg).await {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("Failed to insert FlexNext pager into database: {e}");
-                    continue;
-                }
-            };
-            let Some(r) = r else { continue };
-
-            // let Some(created) = db.create::<Option<RecordId>>("flex_next_messages").content(msg).await? else { continue };
+            // Try to insert the record into the database, reconnecting first if the connection was lost
+            let Some(r) = insert_record(&mut db, &args, "flex_next_messages", msg).await else { continue };
             trace!("Inserted FlexNext pager into database: {:?}", r.key);
 
             continue;
@@ -108,15 +101,8 @@ async fn main() -> Result<()> {
                 message,
             };
 
-            // Try to insert the record into the database
-            let r = match db.create::<Option<RecordId>>("flex_messages").content(msg).await {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("Failed to insert Flex pager into database: {e}");
-                    continue;
-                }
-            };
-            let Some(r) = r else { continue };
+            // Try to insert the record into the database, reconnecting first if the connection was lost
+            let Some(r) = insert_record(&mut db, &args, "flex_messages", msg).await else { continue };
             trace!("Inserted Flex pager into database: {:?}", r.key);
 
             continue;
@@ -139,6 +125,63 @@ async fn open_input(input_path: PathBuf) -> Result<Box<dyn AsyncRead + Unpin + S
         let file = File::open(input_path)
             .await?;
         Ok(Box::new(file))
+    }
+}
+
+/// Connects to the database and signs in once, without retrying.
+async fn connect_db(args: &Args) -> Result<Surreal<Client>> {
+    let db = Surreal::new::<Wss>(args.database_url.clone()).await?;
+    db.signin(surrealdb::opt::auth::Database {
+        namespace: args.ns.clone(),
+        database: args.db.clone(),
+        username: args.username.clone(),
+        password: args.password.clone(),
+    }).await?;
+    Ok(db)
+}
+
+/// Connects to the database, retrying with exponential backoff (capped at `RECONNECT_MAX_DELAY`)
+/// for as long as it takes. Used both for the initial connection and for reconnecting after the
+/// connection is lost, so that a database outage never permanently stops new pagers from being inserted.
+async fn connect_db_with_retry(args: &Args) -> Surreal<Client> {
+    let mut delay = RECONNECT_INITIAL_DELAY;
+    loop {
+        match connect_db(args).await {
+            Ok(db) => {
+                info!("Connected to the database");
+                return db;
+            }
+            Err(e) => {
+                warn!("Failed to connect to the database, retrying in {delay:?}: {e}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(RECONNECT_MAX_DELAY);
+            }
+        }
+    }
+}
+
+/// Inserts `content` into `table`, reconnecting and retrying if the operation times out or fails
+/// due to a connection error. Other errors (e.g. invalid data) are logged and `None` is returned.
+async fn insert_record<T>(db: &mut Surreal<Client>, args: &Args, table: &str, content: T) -> Option<RecordId>
+where
+    T: SurrealValue + Clone,
+{
+    loop {
+        match timeout(DB_OP_TIMEOUT, db.create::<Option<RecordId>>(table).content(content.clone())).await {
+            Ok(Ok(record)) => return record,
+            Ok(Err(e)) if e.details().is_connection() => {
+                warn!("Lost connection to the database, reconnecting: {e}");
+                *db = connect_db_with_retry(args).await;
+            }
+            Ok(Err(e)) => {
+                error!("Failed to insert record into '{table}': {e}");
+                return None;
+            }
+            Err(_) => {
+                warn!("Database operation on '{table}' timed out after {DB_OP_TIMEOUT:?}, reconnecting");
+                *db = connect_db_with_retry(args).await;
+            }
+        }
     }
 }
 
@@ -186,7 +229,7 @@ struct Args {
 
 /// A FLEX_NEXT message
 /// As of multimon v1.5.0, the structure is `FLEX_NEXT|timestamp+tz|baud/levels|cycle.frame.phase|capcode|addr|TYPE|flags|message`
-#[derive(Debug, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 struct FlexNextRecord {
     timestamp: DateTime<Utc>,
     /// Baud rate and modulation level
@@ -205,7 +248,7 @@ struct FlexNextRecord {
     message: String,
 }
 /// The FLEX_NEXT message variants
-#[derive(Debug, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 enum FlexNextType {
     /// Alphanumeric
     ALN,
@@ -224,7 +267,7 @@ enum FlexNextType {
 
 /// A FLEX message
 /// As of multimon v1.5.0, the structure for an alphanumeric flex message is `FLEX|timestamp|baud/level/frag_flag/phase|cycle.frame/capcode/ALN/message`
-#[derive(Debug, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 struct FlexRecord {
     timestamp: DateTime<Utc>,
     /// Baud rate, modulation level, fragmentation flag, phase
@@ -239,7 +282,7 @@ struct FlexRecord {
     /// The message body itself
     message: String
 }
-#[derive(Debug, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 enum FlexType {
     /// Alphanumeric
     ALN
